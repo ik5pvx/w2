@@ -1,0 +1,22 @@
+W2
+==
+
+Commandline (curses) interface for the Elecraft W2 wattmeter.
+
+Disclaimer
+==========
+
+This program is not endorsed by Elecraft.
+
+Author
+======
+
+Pierfrancesco Caci, ik5pvx     - bugs
+
+Usage
+=====
+
+First edit the $serial variable to match your setup. 
+Run 'w2 2> w2.log' from a terminal window. 
+
+
