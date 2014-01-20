@@ -1,0 +1,566 @@
+#!/usr/bin/perl
+#
+# Display values from Elecraft W2 Wattmeter
+# © 2014 Pierfrancesco Caci, ik5pvx
+# License: GNU GPL v3 or later (see below for legal blurb)
+#
+# Usage: change $serial to match your setup. I recommend using udev
+# to create a symlink for you instead of chasing ttyUSBx. Then simply run
+# from an xterm: w2 2> w2.log  (STDERR contains some debug info that
+# messes with main curses display)
+#
+# BUGS
+# How do I make an open menu or the exit dialogue stay on top of the rest?
+# Why does setalarm goes to 0.0 when trying to increase over 5?
+
+use warnings;
+use strict;
+use diagnostics;
+
+use Curses::UI;
+
+use POSIX qw(strftime);
+use Time::HiRes qw(time);
+
+# edit this according to your needs
+my $serial="/dev/ElecraftW2";
+
+
+
+my $f=0; #forward power
+my $r=0; #reverse power
+my $s=1; #swr
+my @onoff = ('OFF','ON ');
+
+
+open (SER,"+< $serial") or die "Can't open serial device $serial.\n$!";
+
+legalblurb();
+my $logver = "# Elecraft W2 detected on $serial, version: " 
+  . sercmd('v') . "\n";
+
+my $cui=new Curses::UI( 
+					   -color_support => 1,
+					   -clear_on_exit => 1,
+					  );
+
+
+my $filemenu = [
+				{-label => 'Clear Log ^X',  -value => \&clearlog	},
+				{-label => 'Exit      ^Q',  -value => \&exit_dialog	},
+			   ];
+
+my $optionsmenu = [
+				   { -label => 'LEDs on/off     L', -value => \&toggleleds,},
+				   { -label => 'LEDs Avg/PEP    M', -value => \&toggleavgl,},
+				   { -label => 'Serial Avg/PEP  N', -value => \&toggleavgs,},
+				   { -label => 'Sensor          O', -value => \&togglesensor,},
+				   { -label => 'LED peak hold   P', -value => \&togglepeakl,},
+				   { -label => 'Sensor Search   Y', -value => \&togglesearch,},
+				   { -label => 'LED Decay Slow  4', -value => sub {&decay(4)},},
+				   { -label => 'LED Decay Mid   5', -value => sub {&decay(5)},},
+				   { -label => 'LED Decay Fast  6', -value => sub {&decay(6)},},
+				   { -label => 'Range Drop Slow 7', -value => sub {&decay(7)},},
+				   { -label => 'Range Drop Mid  8', -value => sub {&decay(8)},},
+				   { -label => 'Range Drop Fast 9', -value => sub {&decay(9)},},
+				  ];
+
+my $rangemenu = [
+				 { -label => 'Autorange 0', -value => sub {&range(0)},},
+				 { -label => 'Low       1', -value => sub {&range(1)},},
+				 { -label => 'Mid       2', -value => sub {&range(2)},},
+				 { -label => 'High      3', -value => sub {&range(3)},},
+				];
+
+my $alarmmenu = [
+				 { -label => 'Alarm                     A', 
+				   -value => \&togglealarm,},
+				 { -label => 'Clear Alarm               C',
+				   -value => \&clearalarm,},
+				 { -label => 'Decrease Alarm trip point [',
+				   -value => sub {&setalarm('[')},},
+				 { -label => 'Increase Alarm trip point ]',
+				   -value => sub {&setalarm(']')},},
+				];
+
+my $calibrationmenu = [
+				 { -label => 'Show Calibration          ?', 
+				   -value => \&showcalibration,},
+				 { -label => 'Increase calibration by 1 +', 
+				   -value => sub {&calibrate('+')},},
+				 { -label => 'Increase calibration by 5 >', 
+				   -value => sub {&calibrate('>')},},
+				 { -label => 'Decrease calibration by 1 -', 
+				   -value => sub {&calibrate('-')},},
+				 { -label => 'Decrease calibration by 5 <', 
+				   -value => sub {&calibrate('<')},},
+				];
+
+
+my @menu = (
+			{ -label => 'File',     -submenu => $filemenu,},
+			{ -label => 'Options',  -submenu => $optionsmenu,},
+			{ -label => 'Range',    -submenu => $rangemenu,},
+			{ -label => 'Alarm',    -submenu => $alarmmenu,},
+			{ -label => 'Calibrate',-submenu => $calibrationmenu,},
+		   );
+
+my $menu = $cui->add(
+    'menu','Menubar',
+    -menu => \@menu,
+    -fg  => "blue",
+);
+
+my $status = $cui->add( 
+					   'status', 'Window',
+					   -border => 1,
+					   -y    => 2,
+					   -bfg  => 'green',
+					   -tfg  => 'green',
+					   -height => 7,
+					   -title => "Elecraft W2 Status",
+					  );
+
+my $statustext = $status->add(
+							  'statustext','TextViewer',
+							  -border => 0,
+							  -fg => 'green',
+							  -text => parseinfo(readinfo()),
+							 );
+
+my $power = $cui->add( 
+					  'power', 'Window',
+					  -border => 1,
+					  -y    => 10,
+					  -bfg  => 'blue',
+					  -tfg  => 'blue',
+					  -height => 5,
+					  -title => "Power & SWR ",
+					);
+
+my $fwd = $power->add(
+					  'fwdbar','Progressbar',
+					  -max => 10,
+					  -pos => $f,
+					  -showvalue => 0,
+					  -nopercentage => 1,
+					  -nocenterline => 0,
+					  -border => 0,
+					  -x => 17,
+					  -fg => 'green',
+					 );
+
+my $rev = $power->add(
+					  'revbar','Progressbar',
+					  -max => 10,
+					  -pos => $r,
+					  -showvalue => 0,
+					  -nopercentage => 1,
+					  -nocenterline => 0,
+					  -border => 0,
+					  -x => 17,
+					  -y => 1,
+					  -fg => 'yellow',
+					 );
+
+my $swr = $power->add(
+					  'swrbar','Progressbar',
+					  -min => 1,
+					  -max => 10,
+					  -pos => $s,
+					  -showvalue => 0,
+					  -nopercentage => 1,
+					  -nocenterline => 0,
+					  -border => 0,
+					  -x => 17,
+					  -y => 2,
+					  -fg => 'red',
+					 );
+
+my $pl = $power->add(
+					 'pwrlabels','TextViewer',
+					 -text => "Forward ...... W\n" .
+					          "Reverse ...... W\n" .
+					          "    SWR .....:1",
+					 -fg => "cyan",
+					);
+
+my $log = $cui->add( 
+					'log', 'Window',
+					-border => 1,
+					-y    => 16,
+					-bfg  => 'white',
+					-tfg  => 'white',
+					#-height => 8,
+					-title => "Log",
+				   );
+
+my $logtext = $log->add(
+						'logtext','TextViewer',
+						-border => 0,
+						-fg => 'white',
+						-text => $logver,
+						-wrapping => 1,
+						-vscrollbar => 1,
+					   );
+
+
+
+#$cui->set_binding( \&exit_dialog , "\cQ");
+$cui->set_binding( sub {exit 0;},  "\cQ");
+$cui->set_binding( \&togglealarm, ('a','A'));
+$cui->set_binding( \&clearalarm , ('c','C'));
+$cui->set_binding( \&toggleleds , ('l','L'));
+$cui->set_binding( \&toggleavgl , ('m','M'));
+$cui->set_binding( \&toggleavgs , ('n','N'));
+$cui->set_binding( \&togglesensor,('o','O'));
+$cui->set_binding( \&togglepeakl, ('p','P'));
+$cui->set_binding( \&togglesearch,('y','Y'));
+$cui->set_binding( \&clearlog,  "\cX");
+$cui->set_binding( sub {&range(0)},  "0");
+$cui->set_binding( sub {&range(1)},  "1");
+$cui->set_binding( sub {&range(2)},  "2");
+$cui->set_binding( sub {&range(3)},  "3");
+$cui->set_binding( \&showcalibration,"?");
+$cui->set_binding( sub {&setalarm('[')}, "[");
+$cui->set_binding( sub {&setalarm(']')}, "]");
+$cui->set_binding( sub {&decay(4)},  "4");
+$cui->set_binding( sub {&decay(5)},  "5");
+$cui->set_binding( sub {&decay(6)},  "6");
+$cui->set_binding( sub {&decay(7)},  "7");
+$cui->set_binding( sub {&decay(8)},  "8");
+$cui->set_binding( sub {&decay(9)},  "9");
+$cui->set_binding( sub {&calibrate('+')},  "+");
+$cui->set_binding( sub {&calibrate('-')},  "-");
+$cui->set_binding( sub {&calibrate('>')},  ">");
+$cui->set_binding( sub {&calibrate('<')},  "<");
+
+
+$cui->add_callback( "getpwr", \&getpwr);
+$cui->{-read_timeout} = 0.1;
+#$cui->set_timer('t1',\&getpwr,0.1);
+$cui->mainloop();
+
+close(SER);
+
+exit 0;
+
+######################################################
+
+sub exit_dialog {
+  my $return = $cui->dialog(
+							-message   => "Do you really want to quit?",
+							-title     => "Are you sure???",
+							-buttons   => ['yes', 'no'],
+							-y         => -4,
+						   );
+  exit(0) if $return;
+};
+
+sub getpwr {
+  my $f=readpwr('f');
+  my $r=readpwr('r');
+  my $s=readswr();
+  my $time = time;
+  my @info = readinfo();
+
+  $statustext->text(parseinfo(@info));
+  $status->draw;
+
+  my $date = strftime "%Y-%m-%d %Tz", gmtime($time);
+
+  my @rangw = (0,2,20,200,2000,0,0,0,0,0); # the extra values are for 
+                                           # when alert is triggered.
+
+  if ($info[1] != 9) {
+  
+	my $scale=$rangw[$info[1]]/10 || 1;
+	print STDERR "$time $f $r $s $scale @info\n";
+	$power->title("Power & SWR $date");
+	$fwd->pos($f/$scale);
+	$rev->pos($r/$scale);
+	if ($s <1) { # swr returns 0 if no power is measured at all
+	  $swr->set_color_fg('black');
+	} elsif ($s < 2) {
+	  $swr->set_color_fg('green');
+	} elsif ($s < 3) {
+	  $swr->set_color_fg('yellow');
+	} else {
+	  $swr->set_color_fg('red');
+	} 
+	$swr->pos($s);
+	$pl->text(sprintf "Forward %6s W\n" .
+			  "Reverse %6s W\n" .
+			  "    SWR %5s:1",$f,$r,$s);
+	
+	$power->draw;
+  } else {
+	logmsg("ALARM HAS BEEN TRIPPED!\n");
+  }
+#  sleep 1;
+}
+
+sub sercmd {
+  my $cmd = shift;
+  my $res ="";
+  print SER $cmd;
+  while (1) {
+	my $c = getc SER;
+	if (defined $c) {
+	  $res .= $c;
+	}
+	return $res if $c eq ";";
+  }
+}
+
+sub readpwr {
+  my $cmd = shift;
+  die "Error: readpwr called with wrong argument $cmd\n" unless 
+	($cmd =~ /[fFrR]/) ;
+  
+  my $result = sercmd($cmd);
+  my $pwr;
+  my $dec;
+#  print STDERR "$result\n";
+  if ( $result =~ /[fFrR](\d{5})D(\d);/) {
+	$pwr = $1;
+	$dec = $2
+  } else {
+	logmsg( "Error: received garbage result $result while attempting to read forward or reverse power\n") ;
+	return 0;
+  } ;
+  return $pwr / 10**$dec;
+  
+}
+
+sub readswr {
+  my $result = sercmd('s');
+  my $swr;
+#  print STDERR "$result\n";
+  if ( $result =~ /[sS](\d{4});/) {
+	$swr = $1;
+  } else {
+	logmsg ( "Error: received garbage result $result while attempting to read swr\n");
+	return 0;
+  } ;
+  return $swr / 100;
+  
+}
+
+sub readinfo {
+  my $result = sercmd('i');
+  my @info;
+#  print STDERR "$result\n";
+  if ( $result =~ /[iI](\d{11});/) {
+	@info = split (//,$1);
+  } elsif ( $result =~ /A!;/) { #swr alert has been triggered
+	@info = (9,9,9,9,9,9,9,9,9,9,9);
+  } else {
+	logmsg ( "Error: received garbage result $result while attempting to read info\n");
+	@info = (0,0,0,0,0,0,0,0,0,0,0);
+  } ;
+  return @info;
+  
+
+}
+
+sub parseinfo {
+  my @i = @_;
+  my @range = ('no sensor', '  2 W    ',' 20 W    ','200 W    ',' 2 kW    ');
+  my @type = ('HF 200 W','HF 2 W  ','VHF     ');
+  my @acts = ('none','S1  ','S2  ');
+  my @rangc = ('manual','auto  ');
+  if ($i[0] == 9) {
+	return "\n\n         MAYDAY MAYDAY MAYDAY!";
+  } else {
+	my $text = "Active Sensor LED: $i[0] " .
+	  "Range: $range[$i[1]] " .
+		"Autorange: $onoff[$i[2]]\n";
+	$text .= "Sensor type: $type[$i[3]] " .
+	  "Attenuator: $onoff[$i[4]]\n";
+	$text .= "LEDs: $onoff[$i[5]] " . 
+	  "Active Sensor: $acts[$i[6]]\n";
+	$text .= "Sensor 1 Range Control: $rangc[$i[7]] " .
+	  "Range Level: $range[$i[8]]\n";
+	$text .= "Sensor 2 Range Control: $rangc[$i[9]] " .
+	  "Range Level: $range[$i[10]]\n";
+	return $text;
+  }
+}
+
+sub legalblurb {
+  print STDERR <<GPL
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+GPL
+}
+
+sub togglealarm {
+  generictoggle('a','Alarm locking');
+};
+
+sub clearalarm {
+  my $result = sercmd('c');
+  $result =~ tr/A-Z/a-z/;
+  if ($result eq "c!;") {
+	logmsg("Alarm cleared\n");
+  } elsif ( $result eq "c;" or $result eq ";") { #bug in the manual?
+	logmsg("Alarm wasn't set\n");
+  } else {
+	logmsg("Error: unexpected result $result while trying to clear alarm\n");
+  }
+};
+
+sub toggleleds {
+  generictoggle('l',"LEDs")
+};
+
+sub toggleavgl {
+  my $result = sercmd('m');
+  $result =~ tr/A-Z/a-z/;
+  if ($result eq "ma;") {
+	logmsg("LEDs now show average forward power\n");
+  } elsif ( $result eq "mp;") { 
+	logmsg("LEDs now show PEP forward power\n");
+  } else {
+	logmsg("Error: unexpected result $result while trying to toggle LED avg/PEP\n");
+  }
+};
+
+sub toggleavgs {
+  my $result = sercmd('n');
+  $result =~ tr/A-Z/a-z/;
+  if ($result eq "na;") {
+	logmsg("Serial data now shows average power\n");
+  } elsif ( $result eq "np;") { 
+	logmsg("Serial data now shows PEP power\n");
+  } else {
+	logmsg("Error: unexpected result $result while trying to toggle serial avg/PEP\n");
+  }
+};
+
+sub togglesensor {
+  my $result = sercmd('o');
+  my ($c,$v) = split (//, $result);
+  if ($c eq 'o') {
+  	logmsg("Now using sensor $v\n");
+  } else {
+	logmsg("Error: unexpected result $result while trying to toggle sensor\n");
+  }
+};
+
+sub togglepeakl {
+  generictoggle('p',"LED Peak-Hold")
+};
+
+sub togglesearch {
+  generictoggle('y','Sensor Search mode');
+};
+
+sub logmsg {
+  my $text = shift;
+  $logtext->text($text . $logtext->get());
+  $logtext->draw;
+}
+
+sub generictoggle {
+  # use only for toggles that respond with 0=off and 1=on
+  my $cmd = shift;
+  my $what = shift;
+  my $result = sercmd($cmd);
+  my ($c,$v) = split (//, $result);
+  if ($c eq $cmd) {
+  	logmsg("$what is/are now $onoff[$v]\n");
+  } else {
+	logmsg("Error: unexpected result $result while toggling $what\n");
+  }
+}
+
+sub clearlog {
+  $logtext->text("");
+  $logtext->draw;
+}
+
+sub range {
+  my $cmd = shift;
+  my $result = sercmd($cmd);
+  my ($c,$v) = split (//, $result);
+  my @rangev=('Auto','Low','Mid','High');
+  if ($c eq $cmd) {
+  	logmsg("Range is now $rangev[$c]\n");
+  } else {
+	logmsg("Error: unexpected result $result while changing range\n");
+  }
+}
+
+sub showcalibration {
+  my $result = sercmd('?');
+  if ($result =~ /(\d{3},){5}\d{3};/) {
+	logmsg("Sensor calibration: $result\n");
+  } else {
+	logmsg("Error: unexpected result $result while getting sensor calibration\n");
+  }
+	
+}
+
+sub setalarm {
+  my $cmd = shift;
+  my $result = sercmd($cmd);
+  my $c;
+  my $v;
+  if ( $result =~ /([\[\]])(\d{2})/ ) {
+	$c = $1;
+	$v = $2/10;
+	# not sure why, but when calling ] over 5.0 it should stay at 5.0
+	# instead here it goes to 0. Both the utility and a plain terminal
+	# will show 5 instead.
+  	logmsg("Alarm will trip when SWR exceeds $v:1\n");
+  } else {
+	logmsg("Error: unexpected result $result while changing alarm trip point\n");
+  }
+  
+}
+
+sub decay {
+  my $cmd = shift;
+  my $result = sercmd($cmd);
+  my ($c,$v) = split (//, $result);
+  my @rangev=('Slow','Mid','Fast');
+  if ($c >= 4 && $c <= 6 ) {
+  	logmsg("LED decay rate is now $rangev[$c%3-1]\n");
+  } elsif ($c >= 7 && $c <= 9 ) {
+  	logmsg("Range drop rate is now $rangev[$c%3-1]\n");
+  } else {
+	logmsg("Error: unexpected result $result while changing LED/Range rate\n");
+  }
+}
+
+sub calibrate {
+  my $cmd = shift;
+  my $result = sercmd($cmd);
+  my $c;
+  my $v;
+  if ($result =~ /([+-<>])(\d{3});/) {
+	$c = $1;
+	$v = $2;
+	if ($c eq '+' or $c eq '>' ) {
+	  logmsg("Calibration reference for active sensor increased to $v\n");
+	} else {
+	  logmsg("Calibration reference for active sensor decreased to $v\n");
+	}
+  } else {
+	logmsg("Error: unexpected result $result while adjusting calibration\n");
+  }
+}
+
